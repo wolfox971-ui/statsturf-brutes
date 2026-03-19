@@ -25,36 +25,54 @@ def details_button(url):
 
 # --- FONCTION DE SCRAPING ---
 async def get_trot_stats(nom_cheval: str):
-    nom_clean = nom_cheval.strip().replace(" ", "-").upper()
-    url = f"https://www.letrot.com/stats/chevaux/{nom_clean}/courses"
-    headers = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15'}
+    # 1. On nettoie le nom pour la recherche
+    query = nom_cheval.strip().replace(" ", "+")
+    search_url = f"https://www.letrot.com/stats/recherche-chevaux?query={query}"
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.letrot.com/'
+    }
     
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-            res = await client.get(url, headers=headers)
-        
-        if res.status_code != 200:
-            return None, f"❌ Impossible de trouver **{nom_cheval}**. Vérifiez l'orthographe."
-        
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        def find_data(label):
-            elem = soup.find(string=lambda t: label in t if t else False)
-            return elem.find_next().text.strip() if elem else "N/A"
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
+            # On cherche d'abord le cheval
+            res = await client.get(search_url, headers=headers)
+            
+            # Si on tombe pas direct sur la fiche, on cherche le premier lien de résultat
+            if "stats/chevaux/" not in str(res.url):
+                soup = BeautifulSoup(res.text, 'html.parser')
+                link_tag = soup.find('a', href=lambda href: href and "/stats/chevaux/" in href)
+                if not link_tag:
+                    return None, f"❌ Aucun résultat trouvé pour **{nom_cheval}**."
+                final_url = f"https://www.letrot.com{link_tag['href']}/courses"
+                res = await client.get(final_url, headers=headers)
+            else:
+                final_url = str(res.url)
 
-        gains = find_data("Gains cumulés")
-        record = find_data("Record")
-        
-        text = (
-            f"🏇 **{nom_cheval.upper()}**\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💰 **Gains :** `{gains}`\n"
-            f"🏆 **Record :** `{record}`\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
-        return url, text
-    except Exception:
-        return None, "⚠️ Le site LeTrot ne répond pas."
+            # 2. Une fois sur la bonne page, on extrait les données
+            soup = BeautifulSoup(res.text, 'html.parser')
+            
+            def find_val(label):
+                # On cherche le texte exact dans les balises
+                target = soup.find(string=lambda t: label in t if t else False)
+                return target.find_next().text.strip() if target else "N/A"
+
+            gains = find_val("Gains cumulés")
+            record = find_val("Record")
+            
+            text = (
+                f"🏇 **{nom_cheval.upper()}**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"💰 **Gains :** `{gains}`\n"
+                f"🏆 **Record :** `{record}`\n"
+                f"━━━━━━━━━━━━━━━━━━"
+            )
+            return final_url, text
+            
+    except Exception as e:
+        logger.error(f"Scraping error: {e}")
+        return None, "⚠️ Le site LeTrot est difficile d'accès. Réessayez."
 
 # --- WEBHOOK ---
 @app.post("/webhook")
