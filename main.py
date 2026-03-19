@@ -1,124 +1,100 @@
 import os
 import httpx
-import logging
 from fastapi import FastAPI, Request
-from telegram import Bot, Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from bs4 import BeautifulSoup
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 
 app = FastAPI()
-
 TOKEN = os.getenv("TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip('/')
 bot = Bot(token=TOKEN)
 
-# --- BOUTONS DU MENU ---
-def main_menu():
-    # Crée deux gros boutons en bas de l'écran Telegram
-    return ReplyKeyboardMarkup([['🏇 Rechercher un cheval', 'ℹ️ Aide']], resize_keyboard=True)
+# --- NAVIGATION INTERACTIVE ---
 
-def details_button(url):
-    # Ajoute un bouton cliquable sous le résultat
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Voir la fiche complète", url=url)]])
+def menu_principal():
+    keyboard = [
+        [InlineKeyboardButton("🔍 Rechercher un trotteur", callback_data='search_start')],
+        [InlineKeyboardButton("📅 Courses du jour", callback_data='races_today')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-# --- FONCTION DE SCRAPING ---
-async def get_trot_stats(nom_cheval: str):
-    # 1. On nettoie le nom pour la recherche
-    query = nom_cheval.strip().replace(" ", "+")
-    search_url = f"https://www.letrot.com/stats/recherche-chevaux?query={query}"
+def menu_cheval(horse_id, nom):
+    # Ici on crée une navigation interne au bot
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Performances", callback_data=f"perf_{horse_id}"),
+            InlineKeyboardButton("🧬 Généalogie", callback_data=f"gene_{horse_id}")
+        ],
+        [InlineKeyboardButton("⬅️ Retour", callback_data="search_start")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- APPELS API OFFICIELS (SETF) ---
+
+async def get_official_horse_data(nom: str):
+    # On utilise l'endpoint de recherche JSON officiel de LeTrot
+    search_url = f"https://www.letrot.com/api/v1/search?q={nom.replace(' ', '+')}"
+    headers = {'X-Requested-With': 'XMLHttpRequest', 'User-Agent': 'Mozilla/5.0'}
     
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://www.letrot.com/'
-    }
-    
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
-            # On cherche d'abord le cheval
-            res = await client.get(search_url, headers=headers)
-            
-            # Si on tombe pas direct sur la fiche, on cherche le premier lien de résultat
-            if "stats/chevaux/" not in str(res.url):
-                soup = BeautifulSoup(res.text, 'html.parser')
-                link_tag = soup.find('a', href=lambda href: href and "/stats/chevaux/" in href)
-                if not link_tag:
-                    return None, f"❌ Aucun résultat trouvé pour **{nom_cheval}**."
-                final_url = f"https://www.letrot.com{link_tag['href']}/courses"
-                res = await client.get(final_url, headers=headers)
-            else:
-                final_url = str(res.url)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # 1. On cherche l'ID interne du cheval
+        r = await client.get(search_url, headers=headers)
+        data = r.json()
+        
+        if not data.get('horses'):
+            return None
+        
+        horse = data['horses'][0] # On prend le premier résultat
+        h_id = horse['id']
+        
+        # 2. On récupère la fiche détaillée (JSON direct, pas de HTML)
+        details_url = f"https://www.letrot.com/api/v1/horse/{h_id}"
+        det = await client.get(details_url, headers=headers)
+        d = det.json()
+        
+        return {
+            "id": h_id,
+            "nom": d['name'],
+            "gains": f"{d['total_gains']:,} €".replace(',', ' '),
+            "record": d['best_record'] or "Aucun",
+            "entraineur": d['trainer_name']
+        }
 
-            # 2. Une fois sur la bonne page, on extrait les données
-            soup = BeautifulSoup(res.text, 'html.parser')
-            
-            def find_val(label):
-                # On cherche le texte exact dans les balises
-                target = soup.find(string=lambda t: label in t if t else False)
-                return target.find_next().text.strip() if target else "N/A"
+# --- GESTION DES ACTIONS (CALLBACKS) ---
 
-            gains = find_val("Gains cumulés")
-            record = find_val("Record")
-            
-            text = (
-                f"🏇 **{nom_cheval.upper()}**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"💰 **Gains :** `{gains}`\n"
-                f"🏆 **Record :** `{record}`\n"
-                f"━━━━━━━━━━━━━━━━━━"
-            )
-            return final_url, text
-            
-    except Exception as e:
-        logger.error(f"Scraping error: {e}")
-        return None, "⚠️ Le site LeTrot est difficile d'accès. Réessayez."
-
-# --- WEBHOOK ---
 @app.post("/webhook")
 async def handle_webhook(request: Request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, bot)
+    data = await request.json()
+    update = Update.de_json(data, bot)
+    
+    # 1. Si l'utilisateur clique sur un bouton
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
         
-        if update.message and update.message.text:
-            text = update.message.text
-            chat_id = update.message.chat_id
+        if query.data == "search_start":
+            await query.edit_message_text("✍️ Tapez le nom du cheval (ex: Idao de Tillard) :")
+            
+        elif query.data.startswith("perf_"):
+            h_id = query.data.split('_')[1]
+            # Ici on appellerait l'API des courses pour ce cheval
+            await query.edit_message_text(f"📈 Chargement des dernières courses pour l'ID {h_id}...")
 
-            if text == "/start" or text == "ℹ️ Aide":
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="👋 **Bienvenue sur StatsTurf !**\n\nUtilisez les boutons ci-dessous pour naviguer.",
-                    reply_markup=main_menu(),
-                    parse_mode="Markdown"
-                )
-
-            elif text == "🏇 Rechercher un cheval":
-                await bot.send_message(chat_id=chat_id, text="✍️ Envoyez-moi le nom d'un cheval (ex: *Bold Eagle*) :", parse_mode="Markdown")
-
+    # 2. Si l'utilisateur envoie un texte
+    elif update.message and update.message.text:
+        text = update.message.text
+        if text == "/start":
+            await bot.send_message(update.message.chat_id, "🏇 **LE TROTTEUR FRANÇAIS**\n_Données officielles SETF_", 
+                                 reply_markup=menu_principal(), parse_mode="Markdown")
+        else:
+            res = await get_official_horse_data(text)
+            if res:
+                msg = (f"🏇 **{res['nom']}**\n"
+                       f"━━━━━━━━━━━━━━\n"
+                       f"💰 Gains : `{res['gains']}`\n"
+                       f"🏆 Record : `{res['record']}`\n"
+                       f"👤 Entraîneur : {res['entraineur']}")
+                await bot.send_message(update.message.chat_id, msg, 
+                                     reply_markup=menu_cheval(res['id'], res['nom']), parse_mode="Markdown")
             else:
-                # On traite l'envoi du nom
-                tmp = await bot.send_message(chat_id=chat_id, text=f"🔍 Analyse de **{text}**...", parse_mode="Markdown")
-                url, result = await get_trot_stats(text)
-                
-                if url:
-                    await bot.send_message(chat_id=chat_id, text=result, reply_markup=details_button(url), parse_mode="Markdown")
-                else:
-                    await bot.send_message(chat_id=chat_id, text=result, parse_mode="Markdown")
-                
-                await bot.delete_message(chat_id=chat_id, message_id=tmp.message_id)
+                await bot.send_message(update.message.chat_id, "❌ Cheval introuvable sur LeTrot.")
 
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        return {"ok": True}
-
-@app.on_event("startup")
-async def startup_event():
-    if TOKEN and WEBHOOK_URL:
-        await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-
-@app.get("/")
-async def root():
-    return {"status": "Bot operational"}
-
+    return {"ok": True}
