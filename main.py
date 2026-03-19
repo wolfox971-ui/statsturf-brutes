@@ -15,52 +15,48 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip('/')
 bot = Bot(token=TOKEN)
 
 # --- INTERFACE : BOUTONS ---
-def get_main_menu():
-    # Boutons permanents en bas de l'écran
-    keyboard = [['🏇 Rechercher un cheval', '📊 Aide']]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+def main_menu():
+    # Crée des boutons persistants en bas du clavier
+    return ReplyKeyboardMarkup([['🏇 Rechercher un cheval', 'ℹ️ Aide']], resize_keyboard=True)
 
-def get_details_button(url):
-    # Bouton cliquable sous le résultat
-    keyboard = [[InlineKeyboardButton("🔍 Voir la fiche LeTrot", url=url)]]
-    return InlineKeyboardMarkup(keyboard)
+def details_button(url):
+    # Bouton cliquable sous le message de résultat
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Voir la fiche LeTrot", url=url)]])
 
-# --- FONCTION DE SCRAPING ---
+# --- SCRAPING ---
 async def get_trot_stats(nom_cheval: str):
     nom_clean = nom_cheval.strip().replace(" ", "-").upper()
     url = f"https://www.letrot.com/stats/chevaux/{nom_clean}/courses"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-        'Referer': 'https://www.letrot.com/'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15'}
     
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
             res = await client.get(url, headers=headers)
         
         if res.status_code != 200:
-            return None, f"❌ Impossible de trouver **{nom_cheval}** sur LeTrot."
+            return None, f"❌ Impossible de trouver **{nom_cheval}**."
         
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        def find_data(label):
+        def find_label(label):
             elem = soup.find(string=lambda t: label in t if t else False)
-            return elem.find_next().text.strip() if elem else "Non disponible"
+            return elem.find_next().text.strip() if elem else "Non renseigné"
 
-        gains = find_data("Gains cumulés")
-        record = find_data("Record")
+        gains = find_label("Gains cumulés")
+        record = find_label("Record")
         
-        msg = (f"🏇 **{nom_cheval.upper()}**\n"
-               f"━━━━━━━━━━━━━━\n"
-               f"💰 **Gains :** `{gains}`\n"
-               f"🏆 **Record :** `{record}`\n"
-               f"━━━━━━━━━━━━━━")
-        return url, msg
-                
+        result_text = (
+            f"🏇 **FICHE CHEVAL : {nom_cheval.upper()}**\n"
+            f"───────────────────\n"
+            f"💰 **Gains :** `{gains}`\n"
+            f"🏆 **Record :** `{record}`\n"
+            f"───────────────────"
+        )
+        return url, result_text
     except Exception:
-        return None, "⚠️ Erreur technique (LeTrot est peut-être saturé)."
+        return None, "⚠️ Erreur lors de la connexion à LeTrot."
 
-# --- GESTION DU WEBHOOK ---
+# --- GESTION DES MESSAGES ---
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     try:
@@ -71,39 +67,39 @@ async def handle_webhook(request: Request):
             text = update.message.text
             chat_id = update.message.chat_id
 
-            if text == "/start" or text == "📊 Aide":
+            if text == "/start" or text == "ℹ️ Aide":
                 await bot.send_message(
                     chat_id=chat_id,
-                    text="👋 **Bienvenue sur StatsTurf !**\n\nUtilisez le menu ci-dessous pour commencer.",
-                    reply_markup=get_main_menu(),
+                    text="👋 **Bienvenue sur StatsTurf !**\n\nUtilisez le menu ci-dessous pour lancer une recherche.",
+                    reply_markup=main_menu(),
                     parse_mode="Markdown"
                 )
 
             elif text == "🏇 Rechercher un cheval":
-                await bot.send_message(chat_id=chat_id, text="✍️ Envoyez-moi le nom d'un cheval (ex: *Bold Eagle*) :", parse_mode="Markdown")
+                await bot.send_message(chat_id=chat_id, text="✍️ Envoyez-moi le **nom du cheval** :", parse_mode="Markdown")
 
             else:
                 # On traite le texte comme un nom de cheval
-                wait_msg = await bot.send_message(chat_id=chat_id, text=f"🔍 Recherche de **{text}**...", parse_mode="Markdown")
+                wait = await bot.send_message(chat_id=chat_id, text=f"🔍 Analyse de **{text}**...", parse_mode="Markdown")
                 url, result = await get_trot_stats(text)
                 
                 if url:
-                    await bot.send_message(chat_id=chat_id, text=result, reply_markup=get_details_button(url), parse_mode="Markdown")
+                    await bot.send_message(chat_id=chat_id, text=result, reply_markup=details_button(url), parse_mode="Markdown")
                 else:
                     await bot.send_message(chat_id=chat_id, text=result, parse_mode="Markdown")
                 
-                await bot.delete_message(chat_id=chat_id, message_id=wait_msg.message_id)
+                await bot.delete_message(chat_id=chat_id, message_id=wait.message_id)
 
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Webhook error: {e}")
         return {"ok": True}
 
 @app.on_event("startup")
-async def startup_event():
+async def on_startup():
     if TOKEN and WEBHOOK_URL:
         await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
 
 @app.get("/")
-async def root():
-    return {"status": "Bot is running"}
+async def health():
+    return {"status": "ok"}
