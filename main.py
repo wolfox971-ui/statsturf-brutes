@@ -8,16 +8,15 @@ from bs4 import BeautifulSoup
 
 app = FastAPI()
 
-# Récupération des variables d'environnement
+# Configuration (Variables Railway)
 TOKEN = os.getenv("TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-if not TOKEN or not WEBHOOK_URL:
-    print("❌ ERREUR: TOKEN ou WEBHOOK_URL manquant !")
-
+# Initialisation du bot et de l'application
 bot = Bot(token=TOKEN)
 application = Application.builder().token(TOKEN).build()
 
+# --- FONCTION SCRAPING ---
 async def get_trot_stats(nom_cheval: str):
     nom_url = nom_cheval.strip().replace(" ", "-").upper()
     url = f"https://www.letrot.com/stats/chevaux/{nom_url}/courses"
@@ -28,53 +27,71 @@ async def get_trot_stats(nom_cheval: str):
             res = await client.get(url, headers=headers, timeout=15.0)
             
         if res.status_code != 200:
-            return f"❌ Cheval non trouvé (Code {res.status_code})"
+            return f"❌ Cheval non trouvé sur LeTrot (Code {res.status_code})"
         
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # Exemple de recherche de données (à adapter selon le HTML de LeTrot)
         def find_data(label):
             elem = soup.find(string=lambda t: label in t if t else False)
-            return elem.find_next().text.strip() if elem else "N/A"
+            return elem.find_next().text.strip() if elem else "Non trouvé"
 
         gains = find_data("Gains cumulés")
         rec = find_data("Record")
         
-        return f"🏇 **TROT - {nom_cheval.upper()}**\n💰 Gains : {gains}\n🏆 Record : {rec}\n🔗 [Fiche]({url})"
+        return (f"🏇 **TROT - {nom_cheval.upper()}**\n"
+                f"💰 Gains : {gains}\n"
+                f"🏆 Record : {rec}\n"
+                f"🔗 [Fiche complète]({url})")
     except Exception as e:
-        return f"⚠️ Erreur : {str(e)}"
+        return f"⚠️ Erreur scraping : {str(e)}"
+
+# --- COMMANDES TELEGRAM ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bonjour ! Envoie-moi /trot_fiche suivi du nom d'un cheval.")
 
 async def trot_fiche(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage : /trot_fiche Nom")
+        await update.message.reply_text("Syntaxe : /trot_fiche Bold Eagle")
         return
+    
     nom = " ".join(context.args)
-    msg = await update.message.reply_text("🔍 Recherche...")
+    wait_msg = await update.message.reply_text(f"🔍 Recherche de '{nom}' sur LeTrot...")
+    
     result = await get_trot_stats(nom)
-    await msg.edit_text(result, parse_mode="Markdown")
+    await wait_msg.edit_text(result, parse_mode="Markdown")
 
+# Ajout des handlers
+application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("trot_fiche", trot_fiche))
 
+# --- ROUTES FASTAPI ---
 @app.post("/webhook")
-async def webhook(request: Request):
-    # C'est ici qu'on s'assure que l'application est prête
-    if not application.updater:
+async def webhook_handler(request: Request):
+    """Réception des messages de Telegram"""
+    # CRITIQUE : Assure que le bot est initialisé AVANT de traiter le message
+    if not application.running:
         await application.initialize()
+        await application.start()
     
-    data = await request.json()
-    update = Update.de_json(data, bot)
-    
-    # On traite l'update
-    await application.process_update(update)
+    try:
+        data = await request.json()
+        update = Update.de_json(data, bot)
+        await application.process_update(update)
+    except Exception as e:
+        print(f"Erreur traitement update: {e}")
+        
     return {"ok": True}
 
 @app.on_event("startup")
-async def startup():
-    # On initialise tout au démarrage
+async def on_startup():
+    """Lancement au démarrage de Railway"""
     await application.initialize()
     await application.start()
-    
-    # On définit le webhook
-    await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-    print(f"✅ Webhook configuré sur {WEBHOOK_URL}/webhook")
+    # On force l'URL du webhook auprès de Telegram
+    webhook_final_url = f"{WEBHOOK_URL}/webhook"
+    await bot.set_webhook(url=webhook_final_url)
+    print(f"🚀 Webhook configuré sur : {webhook_final_url}")
 
+@app.get("/")
+async def health_check():
+    return {"status": "Bot opérationnel", "url": WEBHOOK_URL}
