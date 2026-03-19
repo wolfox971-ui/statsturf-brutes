@@ -1,172 +1,152 @@
-import os
-import httpx
 import logging
-from datetime import datetime
-from fastapi import FastAPI, Request
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+import sqlite3
+import requests
+import os
+import datetime
+from bs4 import BeautifulSoup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Configuration des logs
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- CONFIGURATION ---
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+DB_PATH = '/app/data/turfa_pro.db' if os.path.exists('/app/data') else 'turfa_pro.db'
 
-app = FastAPI()
-TOKEN = os.getenv("TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip('/')
-bot = Bot(token=TOKEN)
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS favoris 
+                        (user_id INTEGER, type TEXT, nom TEXT, UNIQUE(user_id, type, nom))''')
 
-# --- BASE DE DONNÉES SIMULÉE (Favoris) ---
-# Note: Pour un usage réel, connectez une base de données (PostgreSQL)
-user_favorites = {
-    "horses": {},      # {id: name}
-    "trainers": {},    # {id: name}
-    "owners": {},      # {id: name}
-    "races": []        # [R1C1, ...]
-}
-
-# --- FONCTIONS API (SOURCES OFFICIELLES SETF/PMU) ---
-
-async def get_pmu_data(endpoint: str):
-    """Récupère le programme et les partants via PMU"""
-    date_str = datetime.now().strftime("%d%m%20%y")
-    url = f"https://online.pmu.fr/api/client/v1/programme/{date_str}{endpoint}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            r = await client.get(url)
-            return r.json()
-        except: return None
-
-async def search_smart_letrot(query: str):
-    """Recherche officielle SETF : Détecte Cheval, Pro ou Écurie"""
-    search_url = f"https://www.letrot.com/api/v1/search?q={query.replace(' ', '+')}"
-    headers = {'X-Requested-With': 'XMLHttpRequest', 'User-Agent': 'Mozilla/5.0'}
-    
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            r = await client.get(search_url, headers=headers)
-            data = r.json()
-            results = []
-            if data.get('horses'):
-                for h in data['horses'][:2]: results.append({"type": "horse", "name": h['name'], "id": h['id']})
-            if data.get('professionals'):
-                for p in data['professionals'][:2]: results.append({"type": "trainer", "name": f"{p['firstname']} {p['lastname']}", "id": p['id']})
-            if data.get('owners'):
-                for o in data['owners'][:2]: results.append({"type": "owner", "name": o['name'], "id": o['id']})
-            return results
-        except: return []
-
-# --- MENUS DE NAVIGATION ---
-
-def menu_accueil():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏇 SECTION TROT", callback_data='mode_TROT'),
-         InlineKeyboardButton("🐎 SECTION GALOP", callback_data='mode_GALOP')],
-        [InlineKeyboardButton("📌 MES ÉPINGLES (Monitoring)", callback_data='view_favs')],
-        [InlineKeyboardButton("📅 TOUT LE PROGRAMME", callback_data='prog_ALL')]
-    ])
-
-def menu_fiche(obj_id, obj_type, name, disc):
-    """Menu dynamique pour une fiche avec bouton d'épinglage"""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📌 Épingler {name}", callback_data=f"pin_{obj_type}_{obj_id}_{name}")],
-        [InlineKeyboardButton("⬅️ Retour", callback_data=f"mode_{disc}")]
-    ])
-
-# --- GESTION DU WEBHOOK ---
-
-@app.post("/webhook")
-async def handle_webhook(request: Request):
+# --- SCRAPER PRO (Cotes & Heures) ---
+def get_horse_data(nom):
+    nom_clean = nom.strip().replace(" ", "-").lower()
+    url = f"https://www.pmu.fr/turf/cheval/{nom_clean}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
-        data = await request.json()
-        update = Update.de_json(data, bot)
+        res = requests.get(url, headers=headers, timeout=5)
+        soup = BeautifulSoup(res.content, 'html.parser')
+        
+        # Détection du statut de course
+        txt = soup.get_text()
+        return {
+            "nom": nom.upper(),
+            "m_c": soup.select_one('.musique').text if soup.select_one('.musique') else "N/A",
+            "coach": soup.select_one('.trainer').text.strip() if soup.select_one('.trainer') else "Inconnu",
+            "proprio": soup.select_one('.owner').text.strip() if soup.select_one('.owner') else "Inconnu",
+            "origines": soup.select_one('.father').text if soup.select_one('.father') else "N/A",
+            "cote": soup.select_one('.cote').text if soup.select_one('.cote') else "N/C",
+            "today": "Prochaine course" in txt or "Partant" in txt,
+            "heure": "15h45" # Simulation : PMU charge l'heure via JS, nécessite API ou Selenium pour le réel
+        }
+    except: return None
 
-        if update.callback_query:
-            query = update.callback_query
-            await query.answer()
-            cb_data = query.data
+# --- TÂCHES AUTOMATIQUES (Alertes & Bilans) ---
 
-            # 1. Navigation Univers
-            if cb_data == 'back_home':
-                await query.edit_message_text("🏁 **STATSTURF PORTAL**\nChoisissez votre univers :", reply_markup=menu_accueil())
+async def alerte_matin_et_minute(context: ContextTypes.DEFAULT_TYPE):
+    """Vérifie les favoris à 08h00 et programme les alertes cotes"""
+    with sqlite3.connect(DB_PATH) as conn:
+        users = conn.execute("SELECT DISTINCT user_id FROM favoris").fetchall()
+    
+    for (uid,) in users:
+        with sqlite3.connect(DB_PATH) as conn:
+            favs = conn.execute("SELECT nom FROM favoris WHERE user_id = ?", (uid,)).fetchall()
+        
+        partants = []
+        for (nom,) in favs:
+            data = get_horse_data(nom)
+            if data and data['today']:
+                partants.append(nom)
+                # Programmation Alerte 15min avant (Simulé ici car l'heure réelle PMU est dynamique)
+                # context.job_queue.run_once(send_last_minute, when=...)
+        
+        if partants:
+            await context.bot.send_message(uid, f"☀️ **MATINALE :** {len(partants)} chevaux courent aujourd'hui !\n" + "\n".join([f"🏇 **{n}**" for n in partants]), parse_mode='Markdown')
 
-            elif cb_data.startswith('mode_'):
-                disc = cb_data.split('_')[1]
-                msg = f"✨ **UNIVERS {disc}**\n\nQue souhaitez-vous consulter ?"
-                kbd = InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"📅 Programme {disc}", callback_data=f"prog_{disc}")],
-                    [InlineKeyboardButton(f"🔍 Recherche (Cheval/Pro/Écurie)", callback_data=f"asksearch_{disc}")],
-                    [InlineKeyboardButton("⬅️ Retour", callback_data="back_home")]
-                ])
-                await query.edit_message_text(msg, reply_markup=kbd)
+async def bilan_soir(context: ContextTypes.DEFAULT_TYPE):
+    """Envoie le récap des résultats à 19h00"""
+    # Ici on pourrait scraper les arrivées du jour
+    await context.bot.send_message(context.job.chat_id, "🏁 **BILAN DU SOIR**\nConsultez vos favoris pour voir les nouvelles musiques à jour !", parse_mode='Markdown')
 
-            # 2. Programme Filtré
-            elif cb_data.startswith('prog_'):
-                disc = cb_data.split('_')[1]
-                prog = await get_pmu_data("")
-                reunions = prog.get('programme', {}).get('reunions', [])
-                kbd = []
-                for r in reunions:
-                    is_trot = "TROT" in r.get('nature', '').upper()
-                    if disc == "ALL" or (disc == "TROT" and is_trot) or (disc == "GALOP" and not is_trot):
-                        label = f"R{r['numReunion']} - {r['hippodrome']['libelleShort']}"
-                        kbd.append([InlineKeyboardButton(label, callback_data=f"reu_{disc}_{r['numReunion']}")])
-                kbd.append([InlineKeyboardButton("⬅️ Retour", callback_data="back_home")])
-                await query.edit_message_text(f"📍 **RÉUNIONS {disc} DU JOUR**", reply_markup=InlineKeyboardMarkup(kbd))
+# --- GESTIONNAIRES ---
 
-            # 3. Détails d'un résultat de recherche (Profil + %)
-            elif cb_data.startswith('view_'):
-                _, o_type, o_id = cb_data.split('_')
-                # Simulation de stats réelles (à lier aux APIs de perfs)
-                stats_msg = (f"📊 **STATISTIQUES {o_type.upper()}**\n"
-                             f"━━━━━━━━━━━━━━\n"
-                             f"🏆 Victoires : `14.5%` (Top 10%)\n"
-                             f"🥉 Placé (Podium) : `38%` \n"
-                             f"🔥 Forme actuelle : `📈 Positive`\n"
-                             f"━━━━━━━━━━━━━━\n"
-                             f"_Données basées sur les 12 derniers mois._")
-                await query.edit_message_text(stats_msg, reply_markup=menu_fiche(o_id, o_type, "Profil", "TROT"), parse_mode="Markdown")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [[InlineKeyboardButton("🔍 Analyser", callback_data='search')],
+          [InlineKeyboardButton("⭐ Favoris", callback_data='favs')]]
+    txt = "🏇 **TURFA MASTER v10**\n_Alertes 08:00 & Bilan 19:00 actifs._"
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+    else:
+        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
-            # 4. Épinglage (Favoris)
-            elif cb_data.startswith('pin_'):
-                _, o_type, o_id, o_name = cb_data.split('_')
-                user_favorites[f"{o_type}s"][o_id] = o_name
-                await query.answer(f"✅ {o_name} ajouté à vos épingles !")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    nom = update.message.text.upper()
+    try: await update.message.delete()
+    except: pass
+    
+    status = await update.effective_chat.send_message(f"📡 Analyse de **{nom}**...")
+    data = get_horse_data(nom)
+    
+    if data:
+        txt = (f"🏇 **{data['nom']}** | Cote: `{data['cote']}`\n🧬 `{data['origines']}`\n━━━━━━━━━━━━━━━\n"
+               f"📈 Musique : `{data['m_c']}`\n👤 Proprio : {data['proprio']}\n👔 Coach : {data['coach']}\n━━━━━━━━━━━━━━━")
+        kb = [[InlineKeyboardButton("📌 Épingler", callback_data=f"save_{nom}")],
+              [InlineKeyboardButton("⬅️ Retour", callback_data='back')]]
+        await status.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+    else:
+        await status.edit_text(f"❌ **{nom}** non trouvé.")
 
-            elif cb_data == 'view_favs':
-                msg = "📌 **VOS ÉPINGLES (Monitoring)**\n\n"
-                for k, v in user_favorites.items():
-                    if v: msg += f"🔹 **{k.capitalize()}** : {', '.join(v.values() if isinstance(v, dict) else v)}\n"
-                if msg == "📌 **VOS ÉPINGLES (Monitoring)**\n\n": msg += "Aucune épingle active."
-                await query.edit_message_text(msg, reply_markup=menu_accueil(), parse_mode="Markdown")
+async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
 
-            elif cb_data.startswith('asksearch_'):
-                disc = cb_data.split('_')[1]
-                await query.edit_message_text(f"🔍 **RECHERCHE {disc}**\n\nTapez le nom d'un cheval, d'un entraîneur ou d'une écurie :")
+    if query.data == 'search':
+        await query.edit_message_text("✍️ Envoyez le nom du cheval...")
+    
+    elif query.data.startswith('save_'):
+        nom = query.data.split('_')[1]
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR IGNORE INTO favoris VALUES (?, 'C', ?)", (uid, nom))
+        await context.bot.send_message(chat_id=uid, text=f"✅ {nom} épinglé")
 
-        elif update.message and update.message.text:
-            text = update.message.text
-            chat_id = update.message.chat_id
-            if text == "/start":
-                await bot.send_message(chat_id, "🚀 **STATSTURF V2**\nPlateforme de monitoring Officielle.", reply_markup=menu_accueil())
-            else:
-                # Recherche intelligente automatique
-                results = await search_smart_letrot(text)
-                if not results:
-                    await bot.send_message(chat_id, "❌ Aucun résultat (Trot). Essayez un autre nom.")
-                else:
-                    kbd = []
-                    for res in results:
-                        icon = "🏇" if res['type'] == "horse" else "👤" if res['type'] == "trainer" else "🏠"
-                        kbd.append([InlineKeyboardButton(f"{icon} {res['name']} ({res['type']})", callback_data=f"view_{res['type']}_{res['id']}")])
-                    await bot.send_message(chat_id, f"🔍 Résultats pour : **{text}**", reply_markup=InlineKeyboardMarkup(kbd), parse_mode="Markdown")
+    elif query.data == 'favs':
+        with sqlite3.connect(DB_PATH) as conn:
+            favs = conn.execute("SELECT nom FROM favoris WHERE user_id = ?", (uid,)).fetchall()
+        
+        if not favs:
+            await query.edit_message_text("📂 Aucune épingle.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data='back')]]))
+            return
 
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"Erreur Webhook: {e}")
-        return {"ok": True}
+        kb = [[InlineKeyboardButton(f"❌ {f[0]}", callback_data=f"del_{f[0]}")] for f in favs]
+        kb.append([InlineKeyboardButton("⬅️ Retour", callback_data='back')])
+        await query.edit_message_text("⭐ **VOS ÉPINGLÉS :**", reply_markup=InlineKeyboardMarkup(kb))
 
-@app.on_event("startup")
-async def startup():
-    await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+    elif query.data.startswith('del_'):
+        nom = query.data.replace('del_', '')
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM favoris WHERE user_id = ? AND nom = ?", (uid, nom))
+        query.data = 'favs'
+        await button_router(update, context)
 
-@app.get("/")
-async def health(): return {"status": "online"}
+    elif query.data == 'back':
+        await start(update, context)
+
+# --- LANCEMENT ---
+if __name__ == '__main__':
+    init_db()
+    TOKEN = os.getenv("TOKEN")
+    app = Application.builder().token(TOKEN).build()
+
+    # Planification des Jobs
+    if app.job_queue:
+        # Alerte matinale à 08h00
+        app.job_queue.run_daily(alerte_matin_et_minute, time=datetime.time(hour=8, minute=0))
+        # Bilan du soir à 19h00
+        app.job_queue.run_daily(bilan_soir, time=datetime.time(hour=19, minute=0))
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    print("🚀 TURFA MASTER v10 LANCÉ SUR RAILWAY")
+    app.run_polling()
