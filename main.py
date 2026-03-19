@@ -57,18 +57,24 @@ application.add_handler(CommandHandler("trot_fiche", trot_fiche))
 
 @app.post("/webhook")
 async def webhook(request: Request):
+    # C'est ici qu'on s'assure que l'application est prête
+    if not application.updater:
+        await application.initialize()
+    
     data = await request.json()
     update = Update.de_json(data, bot)
+    
+    # On traite l'update
     await application.process_update(update)
     return {"ok": True}
 
 @app.on_event("startup")
 async def startup():
+    # On initialise tout au démarrage
     await application.initialize()
     await application.start()
-    await bot.set_webhook(f"{WEBHOOK_URL}/webhook")
-    print(f"✅ Webhook configuré sur {WEBHOOK_URL}")
+    
+    # On définit le webhook
+    await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+    print(f"✅ Webhook configuré sur {WEBHOOK_URL}/webhook")
 
-@app.get("/")
-async def home():
-    return {"status": "Bot actif"}
